@@ -1,0 +1,338 @@
+import { Router, Request, Response } from 'express';
+import { z } from 'zod';
+import { SolanaService } from '../services/solanaService';
+import { ApiResponse } from '../types';
+
+const router = Router();
+
+// Initialize Solana service
+const solanaService = new SolanaService(process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
+
+// Validation schemas
+const sweepRequestSchema = z.object({
+  walletAddress: z.string().min(32).max(44),
+  accountPubkeys: z.array(z.string().min(32).max(44)).min(1),
+});
+
+/**
+ * GET /accounts/scan/{walletAddress}
+ * Get all cleanup opportunities (closeable and burnable accounts)
+ */
+router.get('/scan/:walletAddress', async (req: Request, res: Response<ApiResponse<any>>) => {
+  try {
+    const { walletAddress } = req.params;
+    
+    // Validate wallet address
+    const isValid = await solanaService.validateWalletAddress(walletAddress);
+    
+    if (!isValid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid wallet address',
+      });
+    }
+
+    // Scan wallet for closeable and burnable accounts
+    const scanResult = await solanaService.scanWallet(walletAddress, {
+      includeEmptyOnly: true,
+      minRecoverableSol: 0,
+      includeBurns: true,
+    });
+
+    // Categorize accounts - accounts can appear in multiple categories
+    const rentAccounts = scanResult.closeableAccounts.filter(acc => 
+      acc.recoverableSol > 0 // Has reclaimable rent
+    );
+    
+    const burnableTokenAccounts = scanResult.closeableAccounts.filter(acc => 
+      solanaService.isAccountBurnable(acc.account, walletAddress) && 
+      acc.account.decimals > 0 && 
+      acc.account.amount !== '0' // Has token balance
+    );
+    
+    const burnableNFTAccounts = scanResult.closeableAccounts.filter(acc => 
+      solanaService.isAccountBurnable(acc.account, walletAddress) && 
+      acc.account.decimals === 0 && 
+      acc.account.amount !== '0' // Has NFT balance
+    );
+
+    // Debug logging to see account categorization
+    console.log(`\n=== ACCOUNT SCAN DEBUG for ${walletAddress} ===`);
+    console.log(`Total accounts found: ${scanResult.totalAccounts}`);
+    console.log(`Total closeable accounts: ${scanResult.closeableAccounts.length}`);
+    console.log(`Rent accounts (reclaimable SOL): ${rentAccounts.length}`);
+    console.log(`Burnable token accounts: ${burnableTokenAccounts.length}`);
+    console.log(`Burnable NFT accounts: ${burnableNFTAccounts.length}`);
+    
+    // Log detailed account info
+    console.log('\n=== DETAILED ACCOUNT BREAKDOWN ===');
+    scanResult.closeableAccounts.forEach((acc, index) => {
+      console.log(`\nAccount ${index + 1}:`);
+      console.log(`  Pubkey: ${acc.account.pubkey.toString()}`);
+      console.log(`  Mint: ${acc.account.mint.toString()}`);
+      console.log(`  Amount: ${acc.account.amount}`);
+      console.log(`  Decimals: ${acc.account.decimals}`);
+      console.log(`  Recoverable SOL: ${acc.recoverableSol}`);
+      console.log(`  Can Close: ${solanaService.isAccountCloseable(acc.account, walletAddress)}`);
+      console.log(`  Can Burn: ${solanaService.isAccountBurnable(acc.account, walletAddress)}`);
+      console.log(`  Has Balance: ${acc.account.amount !== '0'}`);
+      console.log(`  Categories: ${[
+        acc.recoverableSol > 0 ? 'Rent' : '',
+        (solanaService.isAccountBurnable(acc.account, walletAddress) && acc.account.decimals > 0 && acc.account.amount !== '0') ? 'Tokens' : '',
+        (solanaService.isAccountBurnable(acc.account, walletAddress) && acc.account.decimals === 0 && acc.account.amount !== '0') ? 'NFTs' : ''
+      ].filter(cat => cat).join(', ') || 'None'}`);
+    });
+    console.log('=== END DEBUG ===\n');
+
+    // Format responses
+    const formatAccounts = async (accounts: any[], action: string) => {
+      return Promise.all(accounts.map(async (account) => {
+        const mintInfo = await solanaService.getMintInfo(account.account.mint);
+        const isNFT = mintInfo?.decimals === 0;
+
+        return {
+          pubkey: account.account.pubkey.toString(),
+          mint: account.account.mint.toString(),
+          owner: account.account.owner.toString(),
+          amount: account.account.amount,
+          decimals: account.account.decimals,
+          recoverableSol: account.recoverableSol,
+          isInitialized: account.account.isInitialized,
+          isFrozen: account.account.isFrozen,
+          action: action,
+          isNFT: isNFT,
+          tokenName: isNFT ? 'NFT' : 'Token',
+          // Add additional categorization info
+          canClose: solanaService.isAccountCloseable(account.account, walletAddress),
+          canBurn: solanaService.isAccountBurnable(account.account, walletAddress),
+          hasBalance: account.account.amount !== '0',
+        };
+      }));
+    };
+
+    const [formattedRent, formattedBurnableTokens, formattedBurnableNFTs] = await Promise.all([
+      formatAccounts(rentAccounts, 'close'),
+      formatAccounts(burnableTokenAccounts, 'burn'),
+      formatAccounts(burnableNFTAccounts, 'burn')
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        walletAddress,
+        totalAccounts: scanResult.totalAccounts,
+        rentAccounts: formattedRent, // Changed from closeableAccounts
+        burnableTokenAccounts: formattedBurnableTokens,
+        burnableNFTAccounts: formattedBurnableNFTs,
+        totalRecoverableSol: scanResult.totalRecoverableSol,
+        scanTimestamp: scanResult.scanTimestamp,
+      },
+    });
+  } catch (error) {
+    console.error('Account scan error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to scan accounts',
+    });
+  }
+});
+
+/**
+ * POST /accounts/close
+ * Close selected empty accounts
+ */
+router.post('/close', async (req: Request, res: Response<ApiResponse<any>>) => {
+  try {
+    // Validate request body
+    const validatedData = sweepRequestSchema.parse(req.body);
+    
+    // Create close transactions
+    const transactions = await solanaService.createBatchCloseTransactions(
+      validatedData.walletAddress,
+      validatedData.accountPubkeys,
+      'close'
+    );
+
+    // Serialize transactions for frontend
+    const serializedTransactions = transactions.map(tx => ({
+      serialized: tx.serialize({ requireAllSignatures: false }).toString('base64'),
+      signatures: tx.signatures.map((sig: any) => sig.toString()),
+    }));
+
+    // Calculate total recoverable SOL
+    let totalRecoverableSol = 0;
+    for (const accountPubkey of validatedData.accountPubkeys) {
+      try {
+        const accountInfo = await solanaService['connection'].getAccountInfo(
+          new (await import('@solana/web3.js')).PublicKey(accountPubkey)
+        );
+        if (accountInfo) {
+          const rent = await solanaService['connection'].getMinimumBalanceForRentExemption(accountInfo.data.length);
+          totalRecoverableSol += rent / 1e9;
+        }
+      } catch (error) {
+        console.warn(`Failed to calculate rent for ${accountPubkey}:`, error);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        walletAddress: validatedData.walletAddress,
+        closedAccounts: validatedData.accountPubkeys,
+        transactions: serializedTransactions,
+        totalRecoverableSol,
+        message: `Prepared ${transactions.length} close transactions`,
+        action: 'close',
+      },
+    });
+  } catch (error) {
+    console.error('Account close error:', error);
+    
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to create close transactions',
+      });
+    }
+  }
+});
+
+/**
+ * POST /accounts/burn-tokens
+ * Burn selected token accounts
+ */
+router.post('/burn-tokens', async (req: Request, res: Response<ApiResponse<any>>) => {
+  try {
+    // Validate request body
+    const validatedData = sweepRequestSchema.parse(req.body);
+    
+    // Create burn transactions
+    const transactions = await solanaService.createBatchCloseTransactions(
+      validatedData.walletAddress,
+      validatedData.accountPubkeys,
+      'burn'
+    );
+
+    // Serialize transactions for frontend
+    const serializedTransactions = transactions.map(tx => ({
+      serialized: tx.serialize({ requireAllSignatures: false }).toString('base64'),
+      signatures: tx.signatures.map((sig: any) => sig.toString()),
+    }));
+
+    // Calculate total recoverable SOL
+    let totalRecoverableSol = 0;
+    for (const accountPubkey of validatedData.accountPubkeys) {
+      try {
+        const accountInfo = await solanaService['connection'].getAccountInfo(
+          new (await import('@solana/web3.js')).PublicKey(accountPubkey)
+        );
+        if (accountInfo) {
+          const rent = await solanaService['connection'].getMinimumBalanceForRentExemption(accountInfo.data.length);
+          totalRecoverableSol += rent / 1e9;
+        }
+      } catch (error) {
+        console.warn(`Failed to calculate rent for ${accountPubkey}:`, error);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        walletAddress: validatedData.walletAddress,
+        burnedAccounts: validatedData.accountPubkeys,
+        transactions: serializedTransactions,
+        totalRecoverableSol,
+        message: `Prepared ${transactions.length} burn transactions`,
+        action: 'burn',
+      },
+    });
+  } catch (error) {
+    console.error('Token burn error:', error);
+    
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to create burn transactions',
+      });
+    }
+  }
+});
+
+/**
+ * POST /accounts/burn-nfts
+ * Burn selected NFT accounts
+ */
+router.post('/burn-nfts', async (req: Request, res: Response<ApiResponse<any>>) => {
+  try {
+    // Validate request body
+    const validatedData = sweepRequestSchema.parse(req.body);
+    
+    // Create burn transactions
+    const transactions = await solanaService.createBatchCloseTransactions(
+      validatedData.walletAddress,
+      validatedData.accountPubkeys,
+      'burn'
+    );
+
+    // Serialize transactions for frontend
+    const serializedTransactions = transactions.map(tx => ({
+      serialized: tx.serialize({ requireAllSignatures: false }).toString('base64'),
+      signatures: tx.signatures.map((sig: any) => sig.toString()),
+    }));
+
+    // Calculate total recoverable SOL
+    let totalRecoverableSol = 0;
+    for (const accountPubkey of validatedData.accountPubkeys) {
+      try {
+        const accountInfo = await solanaService['connection'].getAccountInfo(
+          new (await import('@solana/web3.js')).PublicKey(accountPubkey)
+        );
+        if (accountInfo) {
+          const rent = await solanaService['connection'].getMinimumBalanceForRentExemption(accountInfo.data.length);
+          totalRecoverableSol += rent / 1e9;
+        }
+      } catch (error) {
+        console.warn(`Failed to calculate rent for ${accountPubkey}:`, error);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        walletAddress: validatedData.walletAddress,
+        burnedNFTs: validatedData.accountPubkeys,
+        transactions: serializedTransactions,
+        totalRecoverableSol,
+        message: `Prepared ${transactions.length} NFT burn transactions`,
+        action: 'burn',
+      },
+    });
+  } catch (error) {
+    console.error('NFT burn error:', error);
+    
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to create NFT burn transactions',
+      });
+    }
+  }
+});
+
+export default router; 

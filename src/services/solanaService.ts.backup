@@ -1,0 +1,351 @@
+import { 
+  Connection, 
+  PublicKey, 
+  Transaction, 
+  SystemProgram,
+  LAMPORTS_PER_SOL 
+} from '@solana/web3.js';
+import { 
+  TOKEN_PROGRAM_ID, 
+  getAccount, 
+  getAssociatedTokenAddress,
+  createCloseAccountInstruction,
+  createBurnInstruction,
+  AccountLayout,
+  MINT_SIZE,
+  getMint,
+  createBurnCheckedInstruction
+} from '@solana/spl-token';
+import { TokenAccountInfo, CloseableAccount, ScanResult } from '../types';
+
+export class SolanaService {
+  private connection: Connection;
+
+  constructor(rpcUrl: string) {
+    this.connection = new Connection(rpcUrl, 'confirmed');
+  }
+
+  /**
+   * Validates a wallet address
+   */
+  async validateWalletAddress(address: string): Promise<boolean> {
+    try {
+      const pubkey = new PublicKey(address);
+      return PublicKey.isOnCurve(pubkey);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Gets all token accounts for a wallet
+   */
+  async getTokenAccounts(walletAddress: string): Promise<TokenAccountInfo[]> {
+    const pubkey = new PublicKey(walletAddress);
+    
+    const tokenAccounts = await this.connection.getTokenAccountsByOwner(pubkey, {
+      programId: TOKEN_PROGRAM_ID,
+    });
+
+    const accounts: TokenAccountInfo[] = [];
+
+    for (const { pubkey: accountPubkey, account } of tokenAccounts.value) {
+      try {
+        const accountInfo = AccountLayout.decode(account.data);
+        
+        accounts.push({
+          pubkey: accountPubkey,
+          mint: new PublicKey(accountInfo.mint),
+          owner: new PublicKey(accountInfo.owner),
+          amount: accountInfo.amount.toString(),
+          decimals: (accountInfo as any).decimals || 0,
+          isInitialized: accountInfo.state === 1,
+          isFrozen: accountInfo.state === 2,
+          isNative: (accountInfo as any).isNativeOption === 1,
+          rentExemptReserve: (accountInfo as any).rentExemptReserve?.toString(),
+          closeAuthority: (accountInfo as any).closeAuthorityOption === 1 
+            ? new PublicKey((accountInfo as any).closeAuthority) 
+            : undefined,
+        });
+      } catch (error) {
+        console.warn(`Failed to decode token account ${accountPubkey.toString()}:`, error);
+      }
+    }
+
+    return accounts;
+  }
+
+  /**
+   * Gets mint information for a token
+   */
+  async getMintInfo(mintAddress: PublicKey) {
+    try {
+      const mintInfo = await getMint(this.connection, mintAddress);
+      return {
+        address: mintAddress,
+        decimals: mintInfo.decimals,
+        supply: mintInfo.supply.toString(),
+        isInitialized: mintInfo.isInitialized,
+        freezeAuthority: mintInfo.freezeAuthority,
+        mintAuthority: mintInfo.mintAuthority,
+      };
+    } catch (error) {
+      console.warn(`Failed to get mint info for ${mintAddress.toString()}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Calculates rent-exempt balance for an account
+   */
+  async calculateRentExemptBalance(accountSize: number): Promise<number> {
+    const rent = await this.connection.getMinimumBalanceForRentExemption(accountSize);
+    return rent / LAMPORTS_PER_SOL;
+  }
+
+  /**
+   * Checks if an account is closeable (empty and owned by the wallet)
+   */
+  isAccountCloseable(account: TokenAccountInfo, walletAddress: string): boolean {
+    const walletPubkey = new PublicKey(walletAddress);
+    
+    return (
+      account.owner.equals(walletPubkey) &&
+      account.amount === '0' &&
+      account.isInitialized &&
+      !account.isFrozen
+    );
+  }
+
+  /**
+   * Checks if an account can be burned (has tokens and owned by the wallet)
+   */
+  isAccountBurnable(account: TokenAccountInfo, walletAddress: string): boolean {
+    const walletPubkey = new PublicKey(walletAddress);
+    
+    return (
+      account.owner.equals(walletPubkey) &&
+      account.amount !== '0' &&
+      account.isInitialized &&
+      !account.isFrozen
+    );
+  }
+
+  /**
+   * Creates a close account transaction
+   */
+  async createCloseTransaction(
+    account: TokenAccountInfo, 
+    walletAddress: string,
+    destinationAddress?: string,
+    blockhash?: string
+  ): Promise<Transaction> {
+    const walletPubkey = new PublicKey(walletAddress);
+    const destination = destinationAddress 
+      ? new PublicKey(destinationAddress) 
+      : walletPubkey;
+
+    const closeInstruction = createCloseAccountInstruction(
+      account.pubkey,
+      destination,
+      walletPubkey,
+      []
+    );
+
+    const transaction = new Transaction();
+    transaction.add(closeInstruction);
+
+    // Get recent blockhash
+    if (blockhash) {
+      transaction.recentBlockhash = blockhash;
+    } else {
+      const { blockhash } = await this.connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+    }
+    transaction.feePayer = walletPubkey;
+
+    return transaction;
+  }
+
+  /**
+   * Creates a burn transaction for tokens
+   */
+  async createBurnTransaction(
+    account: TokenAccountInfo,
+    walletAddress: string,
+    amount?: string,
+    blockhash?: string
+  ): Promise<Transaction> {
+    const walletPubkey = new PublicKey(walletAddress);
+    const burnAmount = amount || account.amount;
+
+    // Get mint info to determine if it's an NFT (decimals = 0)
+    const mintInfo = await this.getMintInfo(account.mint);
+    const isNFT = mintInfo?.decimals === 0;
+
+    let burnInstruction;
+    
+    if (isNFT) {
+      // For NFTs, burn the entire amount
+      burnInstruction = createBurnInstruction(
+        account.pubkey,
+        account.mint,
+        walletPubkey,
+        BigInt(account.amount)
+      );
+    } else {
+      // For regular tokens, use burn checked
+      burnInstruction = createBurnCheckedInstruction(
+        account.pubkey,
+        account.mint,
+        walletPubkey,
+        BigInt(burnAmount),
+        account.decimals
+      );
+    }
+
+    const transaction = new Transaction();
+    transaction.add(burnInstruction);
+
+    // Get recent blockhash
+    if (blockhash) {
+      transaction.recentBlockhash = blockhash;
+    } else {
+      const { blockhash } = await this.connection.getLatestBlockhash();
+      transaction.recentBlockhash = blockhash;
+    }
+    transaction.feePayer = walletPubkey;
+
+    return transaction;
+  }
+
+  /**
+   * Scans wallet for closeable and burnable token accounts
+   */
+  async scanWallet(walletAddress: string, options: {
+    includeEmptyOnly?: boolean;
+    minRecoverableSol?: number;
+    includeBurns?: boolean;
+  } = {}): Promise<ScanResult> {
+    const { 
+      includeEmptyOnly = true, 
+      minRecoverableSol = 0,
+      includeBurns = true 
+    } = options;
+
+    // Validate wallet address
+    if (!(await this.validateWalletAddress(walletAddress))) {
+      throw new Error('Invalid wallet address');
+    }
+
+    // Get all token accounts
+    const allAccounts = await this.getTokenAccounts(walletAddress);
+    
+    // Get a single blockhash for all transactions to reduce RPC calls
+    const { blockhash } = await this.connection.getLatestBlockhash();
+    
+    // Filter accounts
+    const closeableAccounts: CloseableAccount[] = [];
+    const burnableAccounts: CloseableAccount[] = [];
+    let totalRecoverableSol = 0;
+
+    for (const account of allAccounts) {
+      // Check for closeable accounts (empty)
+      if (this.isAccountCloseable(account, walletAddress)) {
+        const accountSize = AccountLayout.span;
+        const rentExemptBalance = await this.calculateRentExemptBalance(accountSize);
+
+        if (rentExemptBalance >= minRecoverableSol) {
+          const closeTransaction = await this.createCloseTransaction(account, walletAddress, undefined, blockhash);
+          
+          closeableAccounts.push({
+            account,
+            recoverableSol: rentExemptBalance,
+            closeTransaction,
+            action: 'close',
+          });
+
+          totalRecoverableSol += rentExemptBalance;
+        }
+      }
+      
+      // Check for burnable accounts (has tokens)
+      if (includeBurns && this.isAccountBurnable(account, walletAddress)) {
+        const accountSize = AccountLayout.span;
+        const rentExemptBalance = await this.calculateRentExemptBalance(accountSize);
+        
+        const burnTransaction = await this.createBurnTransaction(account, walletAddress, undefined, blockhash);
+        
+        burnableAccounts.push({
+          account,
+          recoverableSol: rentExemptBalance,
+          closeTransaction: burnTransaction, // Reuse the field for burn transaction
+          action: 'burn',
+        });
+
+        totalRecoverableSol += rentExemptBalance;
+      }
+    }
+
+    // Combine all accounts
+    const allCloseableAccounts = [...closeableAccounts, ...burnableAccounts];
+
+    return {
+      walletAddress,
+      totalAccounts: allAccounts.length,
+      closeableAccounts: allCloseableAccounts,
+      totalRecoverableSol,
+      scanTimestamp: new Date(),
+    };
+  }
+
+  /**
+   * Creates batch close/burn transactions
+   */
+  async createBatchCloseTransactions(
+    walletAddress: string,
+    accountPubkeys: string[],
+    action: 'close' | 'burn' = 'close'
+  ): Promise<Transaction[]> {
+    const walletPubkey = new PublicKey(walletAddress);
+    const transactions: Transaction[] = [];
+
+    // Get a single blockhash for all transactions to reduce RPC calls
+    const { blockhash } = await this.connection.getLatestBlockhash();
+
+    for (const accountPubkeyStr of accountPubkeys) {
+      try {
+        const accountPubkey = new PublicKey(accountPubkeyStr);
+        const accountInfo = await getAccount(this.connection, accountPubkey);
+        
+        const account: TokenAccountInfo = {
+          pubkey: accountPubkey,
+          mint: accountInfo.mint,
+          owner: accountInfo.owner,
+          amount: accountInfo.amount.toString(),
+          decimals: (accountInfo as any).decimals || 0,
+          isInitialized: accountInfo.isInitialized,
+          isFrozen: accountInfo.isFrozen,
+          isNative: accountInfo.isNative,
+          closeAuthority: accountInfo.closeAuthority || undefined,
+        };
+
+        let transaction: Transaction;
+        
+        if (action === 'burn' && this.isAccountBurnable(account, walletAddress)) {
+          transaction = await this.createBurnTransaction(account, walletAddress, undefined, blockhash);
+        } else if (action === 'close' && this.isAccountCloseable(account, walletAddress)) {
+          transaction = await this.createCloseTransaction(account, walletAddress, undefined, blockhash);
+        } else {
+          continue; // Skip if account doesn't meet criteria
+        }
+
+        transactions.push(transaction);
+      } catch (error) {
+        console.warn(`Failed to create ${action} transaction for ${accountPubkeyStr}:`, error);
+      }
+    }
+
+    return transactions;
+  }
+} 
