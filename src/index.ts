@@ -24,7 +24,9 @@ app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? [
         'https://solvenge83.netlify.app',
-        'https://solvenger.com'
+        'https://solvenger.com',
+        'https://preview--solsweep-retro-sweep.lovable.app',
+        'https://*.lovable.app'
       ] 
     : [
         'http://localhost:3000', 
